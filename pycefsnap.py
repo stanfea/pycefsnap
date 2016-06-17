@@ -22,17 +22,18 @@ import multiprocessing.pool
 import lxml.html
 import logging
 from collections import OrderedDict
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.DEBUG)
-
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 
 def save_html(fpath, html):
     with open(fpath, 'w') as f:
         f.write(html)
 
+
 def save_json(fpath, data):
     with open(fpath, 'w') as f:
         json.dump(data, f)
+
 
 def save_image(fpath, image, width, height):
     image = Image.frombytes("RGBA", (width, height), image, "raw", "RGBA", 0, 1)
@@ -184,6 +185,7 @@ class WebRequestClient:
         # after _responseHeadersReadyCallback.Continue() is called.
         self._resourceHandler._responseHeadersReadyCallback.Continue()
 
+
 class ClientHandler:
     """A client handler is required for the browser to do built in callbacks back into the application."""
     browser = None
@@ -219,36 +221,48 @@ class ClientHandler:
     def OnLoadEnd(self, browser, frame, httpStatusCode):
         if self.isLoading or self.doneEnd:
             return
-        logging.info("Finished loading page")
+
         self.doneEnd = True
         metadata = browser.GetUserData("metadata")
+        if httpStatusCode != 200:
+            metadata['error'] = "Failed loading page got status code %s" % httpStatusCode
+            cefpython.QuitMessageLoop()
+            return
+        logging.info("Finished loading page")
         metadata['loaded'] = 1
         metadata['content'] = 1
         metadata['content_time'] = int(time())
         metadata['response_code'] = httpStatusCode
         browser.SetUserData("metadata", metadata)
-        if 'script' not in self.command:
+        if 'script' not in self.command or not self.command['script']:
             script = ""
         else:
             logging.info("Executing user JS");
             script = self.command['script']
+        script += '''; function flashOnPage() {
+objects = document.querySelectorAll("object");
+for (var i=0; i < objects.length; i++) {
+if ("classid" in objects[i].attributes || objects[i].type == "application/x-shockwave-flash") return true;
+} return false;}'''
         if 'size' in self.command and self.command['size'] != "screen":
-            script += "; scrollWidth = document.body.scrollWidth; scrollHeight = document.body.scrollHeight; " +\
-                     "clientWidth = document.body.clientWidth; clientHeight = document.body.clientHeight; " +\
-                     "width = (scrollWidth > clientWidth) ? scrollWidth + 10 : clientWidth; " +\
-                     "height = (scrollHeight > clientHeight) ? scrollHeight + 10 : clientHeight; " +\
-                     "setPageSize(width, height);"
-        delay = self.command['delay']
-        script += ";  setTimeout(function() { jsCallback(document.documentElement.innerHTML);}, %s);" % (delay * 1000)
-        logging.info("Waiting %ds" % delay)
+            script += '''scrollWidth = document.body.scrollWidth; scrollHeight = document.body.scrollHeight;
+clientWidth = document.body.clientWidth; clientHeight = document.body.clientHeight;
+width = (scrollWidth > clientWidth) ? scrollWidth + 10 : clientWidth;
+height = (scrollHeight > clientHeight) ? scrollHeight + 10 : clientHeight;
+setPageSize(width, height);'''
+        script += ''';  if (flashOnPage()) { timeout = flash_delay; console.log("Detected flash")}
+                 else { timeout = delay; log("Didn\'t detect flash")}
+                 log("Waiting " + timeout + "s");
+                 setTimeout(function() { jsCallback(document.documentElement.innerHTML);}, timeout * 1000);'''
         browser.GetMainFrame().ExecuteJavascript(script)
 
+    def OnConsoleMessage(self, browser, message, source, line):
+        logging.debug(message)
+        return True
 
     def OnLoadError(self, browser, frame, errorCode, errorText, failedURL):
         metadata = browser.GetUserData("metadata")
-        metadata['status'] = "error"
         metadata['error'] = errorText
-        metadata['time_finished'] = int(time())
         browser.SetUserData("metadata", metadata)
         cefpython.QuitMessageLoop()
 
@@ -275,6 +289,7 @@ class ClientHandler:
     def _OnResourceResponse(self, browser, frame, request, requestStatus, requestError, response, data):
         metadata = browser.GetUserData("metadata")
         metadata['content_type'] = response.GetMimeType()
+        metadata['status']= response.GetStatusText()
         browser.SetUserData("metadata", metadata)
         return data
 
@@ -326,11 +341,13 @@ elements are present in the page
 - timeout: timeout in seconds
 """
 
+
 def setPageSize(width, height):
     browser = cefpython.GetBrowserByWindowHandle(0)
     browser.SetUserData("width", width)
     browser.SetUserData("height", height)
     browser.WasResized()
+
 
 def jsCallback(html):
     browser = cefpython.GetBrowserByWindowHandle(0)
@@ -340,10 +357,12 @@ def jsCallback(html):
     browser.SetUserData("html", html)
     cefpython.QuitMessageLoop()
 
+
 def snap(command, width=800, height=600):
     logging.info("Snapshot url: %s" % command['url'])
     metadata = dict()
     metadata['timestamp'] = int(time())
+    metadata['error'] = "0"
     parent_dir = os.path.dirname(command['file'])
     if parent_dir and not os.path.exists(parent_dir):
         os.makedirs(parent_dir)
@@ -398,8 +417,11 @@ def snap(command, width=800, height=600):
     browser.SetUserData("metadata", metadata)
     browser.SetClientHandler(ClientHandler(browser, command))
     jsBindings = cefpython.JavascriptBindings(bindToFrames=True, bindToPopups=True)
-    jsBindings.SetProperty("setPageSize", setPageSize)
+    jsBindings.SetProperty("delay", int(command['delay']))
+    jsBindings.SetProperty("flash_delay", int(command['flash_delay']))
+    jsBindings.SetFunction("setPageSize", setPageSize)
     jsBindings.SetFunction("jsCallback", jsCallback)
+    jsBindings.SetFunction("log", logging.info)
     browser.SetJavascriptBindings(jsBindings)
     #browser.WasResized()
     cefpython.MessageLoop()
@@ -408,6 +430,12 @@ def snap(command, width=800, height=600):
     image = browser.GetUserData("image")
     html = browser.GetUserData("html")
     metadata = browser.GetUserData("metadata")
+    if metadata['error'] == "0":
+        metadata['status'] = "OK"
+        metadata['finished'] = int(time())
+    else:
+        metadata['status'] = "error"
+        metadata['time_finished'] = int(time())
     cefpython.Shutdown()
     return width, height, image, html, metadata
 
@@ -449,9 +477,6 @@ def main():
             timeout = int(command['timeout'])
         logging.info("Setting timeout at %ds" % timeout)
         width, height, image, html, metadata = async_result.get(timeout=timeout)
-        metadata['status'] = "OK"
-        metadata['error'] = "0"
-        metadata['finished'] = int(time())
     except multiprocessing.TimeoutError:
         logging.error("Timeout")
         metadata['status'] = "error"
@@ -462,11 +487,15 @@ def main():
         traceback.print_exc()
         metadata['status'] = "error"
         metadata['error'] = str(sys.exc_info())
+        metadata['time_finished'] = int(time())
     finally:
         basename = os.path.splitext(command['file'])[0]
         fpath = {'png': basename + ".png",
                  'html': basename + ".html",
-                 'metadata': basename + ".png.finished"}
+                 'metadata': basename + ".finished"}
+        error = metadata['error'] != "0"
+        if error:
+            logging.error(metadata['error'])
         if html:
             if int(command['details']) == 3:
                 url = metadata['final_url']
@@ -478,15 +507,17 @@ def main():
                 metadata['applets'] = get_elements(url, xhtml, 'applet')
                 metadata['iframes'] = get_elements(url, xhtml, 'iframe')
             logging.info("Saving html: %s" % fpath['html'])
-            save_html(fpath['html'], html)
+            if int(command['html']) == 1:
+                save_html(fpath['html'], html)
         if metadata:
             logging.info("Saving metadata: %s" % fpath['metadata'])
-            save_json(fpath['metadata'], metadata)
+            command.update(metadata)
+            save_json(fpath['metadata'], command)
+        if error:
+            sys.exit(1)
         if image:
            logging.info("Saving snapshot (%dx%d): %s" % (width, height, fpath['png']))
            save_image(fpath['png'], image, width, height)
-        if 'status' in metadata and metadata['status'] == "error":
-           sys.exit(1)
         sys.exit(0)
 
 if __name__ == "__main__":
