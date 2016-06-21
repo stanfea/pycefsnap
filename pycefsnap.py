@@ -71,8 +71,10 @@ class ResourceHandler:
         # To skip cache set the SkipCache request flag.
         request.SetFlags(cefpython.Request.Flags["AllowCachedCredentials"] \
                          | cefpython.Request.Flags["AllowCookies"])
-        if 'referer' in self._command and self._command['referer']:
-            request.SetHeaderMap({'Referer': self._command['referer']})
+        if 'headers' in self._command:
+            headers = request.GetHeaderMap()  # keep headers set by cookieManager
+            headers.update(self._command['headers'])
+            request.SetHeaderMap(headers)
 
 
         # A strong reference to the WebRequest object must kept.
@@ -234,27 +236,29 @@ class ClientHandler:
         metadata['content_time'] = int(time())
         metadata['response_code'] = httpStatusCode
         browser.SetUserData("metadata", metadata)
-        if 'script' not in self.command or not self.command['script']:
-            script = ""
-        else:
-            logging.info("Executing user JS");
-            script = self.command['script']
-        script += '''; function flashOnPage() {
-objects = document.querySelectorAll("object");
-for (var i=0; i < objects.length; i++) {
-if ("classid" in objects[i].attributes || objects[i].type == "application/x-shockwave-flash") return true;
-} return false;}'''
+        frame = browser.GetMainFrame()
         if 'size' in self.command and self.command['size'] != "screen":
-            script += '''scrollWidth = document.body.scrollWidth; scrollHeight = document.body.scrollHeight;
-clientWidth = document.body.clientWidth; clientHeight = document.body.clientHeight;
-width = (scrollWidth > clientWidth) ? scrollWidth + 10 : clientWidth;
-height = (scrollHeight > clientHeight) ? scrollHeight + 10 : clientHeight;
-setPageSize(width, height);'''
-        script += ''';  if (flashOnPage()) { timeout = flash_delay; console.log("Detected flash")}
-                 else { timeout = delay; log("Didn\'t detect flash")}
-                 log("Waiting " + timeout + "s");
-                 setTimeout(function() { jsCallback(document.documentElement.innerHTML);}, timeout * 1000);'''
-        browser.GetMainFrame().ExecuteJavascript(script)
+            frame.ExecuteJavascript('''
+                scrollWidth = document.body.scrollWidth; scrollHeight = document.body.scrollHeight;
+                clientWidth = document.body.clientWidth; clientHeight = document.body.clientHeight;
+                width = (scrollWidth > clientWidth) ? scrollWidth + 10 : clientWidth;
+                height = (scrollHeight > clientHeight) ? scrollHeight + 10 : clientHeight;
+                setPageSize(width, height);''')
+        if 'script' in self.command and self.command['script']:
+            logging.info("Executing user JS")
+            frame.ExecuteJavascript(self.command['script'])
+        frame.ExecuteJavascript('''
+            function flashOnPage() {
+                objects = document.querySelectorAll("object");
+                for (var i=0; i < objects.length; i++) {
+                    if ("classid" in objects[i].attributes || objects[i].type == "application/x-shockwave-flash") return true;
+                }
+             return false;
+            };
+            if (flashOnPage()) { timeout = flash_delay; log("Detected flash")}
+            else { timeout = delay; log("Didn\'t detect flash")}
+            log("Waiting " + timeout + "s");
+            setTimeout(function() { jsCallback(document.documentElement.innerHTML);}, timeout * 1000);''')
 
     def OnConsoleMessage(self, browser, message, source, line):
         logging.debug(message)
@@ -359,85 +363,91 @@ def jsCallback(html):
 
 
 def snap(command, width=800, height=600):
-    logging.info("Snapshot url: %s" % command['url'])
-    metadata = dict()
-    metadata['timestamp'] = int(time())
-    metadata['error'] = "0"
-    parent_dir = os.path.dirname(command['file'])
-    if parent_dir and not os.path.exists(parent_dir):
-        os.makedirs(parent_dir)
-    if 'screen_width' in command:
-        width = int(command['screen_width'])
-    if 'screen_height' in command:
-        height = int(command['screen_height'])
-    cefpython.g_debug = False
-    commandLineSwitches = dict()
-    if 'proxies' in command:
-        proxy = command['proxies'][0]
-        logging.info("Proxy server: %s:1080" % proxy)
-        commandLineSwitches['proxy-server'] = "socks5://" + proxy + ":1080"
-    settings = {
-        "log_severity": cefpython.LOGSEVERITY_DISABLE,  # LOGSEVERITY_VERBOSE
-        "log_file": "",
-        "release_dcheck_enabled": False, # Enable only when debugging.
-        # This directories must be set on Linux
-        "locales_dir_path": cefpython.GetModuleDirectory()+"/locales",
-        "resources_dir_path": cefpython.GetModuleDirectory(),
-        "multi_threaded_message_loop": False,
-        "unique_request_context_per_browser": True,
-        "browser_subprocess_path": "%s/%s" % (
-            cefpython.GetModuleDirectory(), "subprocess")
-    }
-    cefpython.Initialize(settings, commandLineSwitches)
-    windowInfo = cefpython.WindowInfo()
-    windowInfo.SetAsOffscreen(0)
-    browserSettings = {"default_encoding": "utf-8"}
-    browser = cefpython.CreateBrowserSync(windowInfo, browserSettings, navigateUrl=command['url'])
-    cookieManager = cefpython.CookieManager.CreateManager("")
-    if 'cookie' in command and command['cookie']:
-        for cookie in command['cookie'].split(";"):
-            name, value = cookie.split("=")
-            cookie = cefpython.Cookie()
-            cookie.SetName(name)
-            cookie.SetValue(value)
-            cookie.SetHasExpires(False)
-            cookieManager.SetCookie(command['url'], cookie)
-    browser.SetUserData("cookieManager", cookieManager)
-    #browser = cefpython.CreateBrowserSync(windowInfo, browserSettings, navigateUrl="about:blank")
-    # TODO handle post data
-    #req = cefpython.Request.CreateRequest()
-    #req.SetUrl(command['url'])
-    # req.SetMethod("POST")
-    # a = req.SetPostData([])
-    #browser.GetMainFrame().LoadRequest(req)
+    metadata = {}
+    try:
+        logging.info("Snapshot url: %s" % command['url'])
+        metadata['timestamp'] = int(time())
+        metadata['error'] = "0"
+        parent_dir = os.path.dirname(command['file'])
+        if parent_dir and not os.path.exists(parent_dir):
+            os.makedirs(parent_dir)
+        if 'screen_width' in command:
+            width = command['screen_width']
+        if 'screen_height' in command:
+            height = command['screen_height']
+        cefpython.g_debug = False
+        commandLineSwitches = dict()
+        if 'proxies' in command and type(command['proxies']) == type([]) and command['proxies']:
+            proxy = command['proxies'][0]
+            logging.info("Proxy server: %s:1080" % proxy)
+            commandLineSwitches['proxy-server'] = "socks5://" + proxy + ":1080"
+        settings = {
+            "log_severity": cefpython.LOGSEVERITY_DISABLE,  # LOGSEVERITY_VERBOSE
+            "log_file": "",
+            "release_dcheck_enabled": False, # Enable only when debugging.
+            # This directories must be set on Linux
+            "locales_dir_path": cefpython.GetModuleDirectory()+"/locales",
+            "resources_dir_path": cefpython.GetModuleDirectory(),
+            "multi_threaded_message_loop": False,
+            "unique_request_context_per_browser": True,
+            "browser_subprocess_path": "%s/%s" % (
+                cefpython.GetModuleDirectory(), "subprocess")
+        }
+        cefpython.Initialize(settings, commandLineSwitches)
+        windowInfo = cefpython.WindowInfo()
+        windowInfo.SetAsOffscreen(0)
+        browserSettings = {"default_encoding": "utf-8"}
+        browser = cefpython.CreateBrowserSync(windowInfo, browserSettings, navigateUrl=command['url'])
+        cookieManager = cefpython.CookieManager.CreateManager("")
+        if 'cookie' in command:
+            for k, v in command['cookie'].items():
+                cookie = cefpython.Cookie()
+                cookie.SetName(k)
+                cookie.SetValue(v)
+                cookie.SetHasExpires(False)
+                cookieManager.SetCookie(command['url'], cookie)
+        browser.SetUserData("cookieManager", cookieManager)
+        #browser = cefpython.CreateBrowserSync(windowInfo, browserSettings, navigateUrl="about:blank")
+        # TODO handle post data
+        #req = cefpython.Request.CreateRequest()
+        #req.SetUrl(command['url'])
+        # req.SetMethod("POST")
+        # a = req.SetPostData([])
+        #browser.GetMainFrame().LoadRequest(req)
 
-    browser.SendFocusEvent(True)
-    browser.SetUserData("width", width)
-    browser.SetUserData("height", height)
-    browser.SetUserData("metadata", metadata)
-    browser.SetClientHandler(ClientHandler(browser, command))
-    jsBindings = cefpython.JavascriptBindings(bindToFrames=True, bindToPopups=True)
-    jsBindings.SetProperty("delay", int(command['delay']))
-    jsBindings.SetProperty("flash_delay", int(command['flash_delay']))
-    jsBindings.SetFunction("setPageSize", setPageSize)
-    jsBindings.SetFunction("jsCallback", jsCallback)
-    jsBindings.SetFunction("log", logging.info)
-    browser.SetJavascriptBindings(jsBindings)
-    #browser.WasResized()
-    cefpython.MessageLoop()
-    width = browser.GetUserData("width")
-    height = browser.GetUserData("height")
-    image = browser.GetUserData("image")
-    html = browser.GetUserData("html")
-    metadata = browser.GetUserData("metadata")
-    if metadata['error'] == "0":
-        metadata['status'] = "OK"
-        metadata['finished'] = int(time())
-    else:
-        metadata['status'] = "error"
-        metadata['time_finished'] = int(time())
-    cefpython.Shutdown()
-    return width, height, image, html, metadata
+        browser.SendFocusEvent(True)
+        browser.SetUserData("width", width)
+        browser.SetUserData("height", height)
+        browser.SetUserData("metadata", metadata)
+        browser.SetClientHandler(ClientHandler(browser, command))
+        jsBindings = cefpython.JavascriptBindings(bindToFrames=True, bindToPopups=True)
+        jsBindings.SetProperty("delay", int(command['delay']))
+        jsBindings.SetProperty("flash_delay", int(command['flash_delay']))
+        jsBindings.SetFunction("setPageSize", setPageSize)
+        jsBindings.SetFunction("jsCallback", jsCallback)
+        jsBindings.SetFunction("log", logging.info)
+        browser.SetJavascriptBindings(jsBindings)
+        #browser.WasResized()
+        cefpython.MessageLoop()
+        width = browser.GetUserData("width")
+        height = browser.GetUserData("height")
+        metadata = browser.GetUserData("metadata")
+        image = browser.GetUserData("image")
+        html = browser.GetUserData("html")
+
+    except:
+        logging.error(sys.exc_info())
+        traceback.print_exc()
+        metadata['error'] = str(sys.exc_info())
+    finally:
+        if metadata['error'] == "0":
+            metadata['status'] = "OK"
+            metadata['finished'] = int(time())
+        else:
+            metadata['status'] = "error"
+            metadata['time_finished'] = int(time())
+        cefpython.Shutdown()
+        return width, height, image, html, metadata
 
 
 def get_elements(url, xhtml, tag):
@@ -459,24 +469,65 @@ def get_elements(url, xhtml, tag):
     return elements
 
 
+def load_command(fpath):
+    with open(fpath) as f:
+        command = json.load(f)
+        command = dict((k, v) for k, v in command.iteritems() if v)  # remove keys with empty values
+    types = {'action': str,
+             'cookie': str,
+             'delay': int,
+             'details': int,
+             'file': str,
+             'flash_delay': int,
+             'delay': int,
+             'headers': str,
+             'height': int,
+             'id': int,
+             'instance_id': int,
+             'priority': int,
+             'real_id': int,
+             'referer': str,
+             'screen_height': int,
+             'screen_width': int,
+             'server': str,
+             'size': str,
+             'shot_interval': int,
+             'shots': int,
+             'timeout': int,
+             'url': str,
+             'useragent': str,
+             'virtual_id': int,
+             'width': int}
+    command.update({k: types[k](v) if k in types else v for k, v in command.items()})
+    if 'cookie' in command:
+        command.update({'cookie': dict(map(lambda x: x.split('='), command['cookie'].split(';')))})
+    if 'headers' in command:
+        command.update({'headers': dict(map(lambda x: x.split(': '), command['headers'].split('\n')))})
+    if 'referer' in command:
+        headers = command['headers'] if 'headers' in command else {}
+        command['headers']['Referer'] = command['referer']
+    if 'proxies' in command:
+        if type(command['proxies']) != list:
+            raise Exception("proxies must be a list in command json")
+
+    return command
+
+
 def main():
     if len(sys.argv) < 2:
         print_usage()
         sys.exit(0)
-    with open(os.path.abspath(sys.argv[1])) as f:
-        command = json.load(f)
-
+    command = load_command(os.path.abspath(sys.argv[1]))
     pool = multiprocessing.pool.ThreadPool(processes=1)
     metadata = dict()
     html = None
     image = None
     async_result = pool.apply_async(snap, (command,))
     try:
-        timeout = 60
-        if 'timeout' in command:
-            timeout = int(command['timeout'])
+        timeout = command['timeout'] if 'timeout' in command else 60
         logging.info("Setting timeout at %ds" % timeout)
         width, height, image, html, metadata = async_result.get(timeout=timeout)
+
     except multiprocessing.TimeoutError:
         logging.error("Timeout")
         metadata['status'] = "error"
@@ -485,9 +536,7 @@ def main():
     except:
         logging.error(sys.exc_info())
         traceback.print_exc()
-        metadata['status'] = "error"
         metadata['error'] = str(sys.exc_info())
-        metadata['time_finished'] = int(time())
     finally:
         basename = os.path.splitext(command['file'])[0]
         fpath = {'png': basename + ".png",
@@ -497,7 +546,7 @@ def main():
         if error:
             logging.error(metadata['error'])
         if html:
-            if int(command['details']) == 3:
+            if 'details' in command and command['details'] == 3:
                 url = metadata['final_url']
                 xhtml = lxml.html.document_fromstring(html)
                 metadata['images'] = get_elements(url, xhtml, 'img')
@@ -507,7 +556,7 @@ def main():
                 metadata['applets'] = get_elements(url, xhtml, 'applet')
                 metadata['iframes'] = get_elements(url, xhtml, 'iframe')
             logging.info("Saving html: %s" % fpath['html'])
-            if int(command['html']) == 1:
+            if 'html' in command and command['html'] == 1:
                 save_html(fpath['html'], html)
         if metadata:
             logging.info("Saving metadata: %s" % fpath['metadata'])
