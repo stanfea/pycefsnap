@@ -244,7 +244,7 @@ class ClientHandler:
                 width = (scrollWidth > clientWidth) ? scrollWidth + 10 : clientWidth;
                 height = (scrollHeight > clientHeight) ? scrollHeight + 10 : clientHeight;
                 setPageSize(width, height);''')
-        if 'script' in self.command and self.command['script']:
+        if 'script' in self.command:
             logging.info("Executing user JS")
             frame.ExecuteJavascript(self.command['script'])
         frame.ExecuteJavascript('''
@@ -377,7 +377,7 @@ def snap(command, width=800, height=600):
             height = command['screen_height']
         cefpython.g_debug = False
         commandLineSwitches = dict()
-        if 'proxies' in command and type(command['proxies']) == type([]) and command['proxies']:
+        if 'proxies' in command:
             proxy = command['proxies'][0]
             logging.info("Proxy server: %s:1080" % proxy)
             commandLineSwitches['proxy-server'] = "socks5://" + proxy + ":1080"
@@ -504,8 +504,10 @@ def load_command(fpath):
     if 'headers' in command:
         command.update({'headers': dict(map(lambda x: x.split(': '), command['headers'].split('\n')))})
     if 'referer' in command:
-        headers = command['headers'] if 'headers' in command else {}
-        command['headers']['Referer'] = command['referer']
+        if 'headers' in command:
+            command['headers']['Referer'] = command['referer']
+        else:
+            command['headers'] = {'Referer': command['referer']}
     if 'proxies' in command:
         if type(command['proxies']) != list:
             raise Exception("proxies must be a list in command json")
